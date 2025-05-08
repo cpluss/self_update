@@ -13,39 +13,39 @@ fn run() -> Result<()> {
     // But we still support the explicit credential format for backward compatibility
     let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
     let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
-    
+
     // Format credentials as expected by the auth_token method (access_key:secret_key)
     let aws_credentials = format!("{}:{}", aws_access_key, aws_secret_key);
 
     println!("Listing available releases from private S3 bucket...");
-    
+
     // Configure the ReleaseList to fetch releases from a private S3 bucket
     let releases = ReleaseList::configure()
         .bucket_name("my-private-releases-bucket")
-        .region("us-west-2")              // AWS region where your bucket is located
+        .region("us-west-2") // AWS region where your bucket is located
         .with_target("x86_64-unknown-linux-gnu") // Optional: filter for a specific target
-        .auth_token(&aws_credentials)     // Provide AWS credentials for authenticated access
+        .auth_token(&aws_credentials) // Provide AWS credentials for authenticated access
         .build()?
         .fetch()?;
-    
+
     if releases.is_empty() {
         println!("No releases found.");
         return Ok(());
     }
-    
+
     println!("Found {} releases:", releases.len());
-    
+
     for release in releases {
         println!("Release: {} ({})", release.name, release.version);
         println!("  Date: {}", release.date);
         println!("  Assets:");
-        
+
         for asset in release.assets {
             println!("    - {}", asset.name);
         }
         println!();
     }
-    
+
     Ok(())
 }
 

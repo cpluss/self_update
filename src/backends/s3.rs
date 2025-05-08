@@ -24,10 +24,7 @@ use {
 };
 
 #[cfg(not(feature = "aws-sdk"))]
-use {
-    quick_xml::events::Event,
-    quick_xml::Reader,
-};
+use {quick_xml::events::Event, quick_xml::Reader};
 
 /// Maximum number of items to retrieve from S3 API
 const MAX_KEYS: i32 = 100;
@@ -86,11 +83,11 @@ impl ReleaseListBuilder {
         self.target = Some(target.to_owned());
         self
     }
-    
+
     /// Set the authorization token or AWS credentials, used in requests to the S3 API
     ///
     /// For AWS S3 buckets that require authentication, provide credentials in the format "ACCESS_KEY:SECRET_KEY"
-    /// 
+    ///
     /// This is to support private S3 buckets where you need AWS credentials.
     /// **Make sure not to bake the credentials into your app**; it is recommended
     /// you obtain them via another mechanism, such as environment variables
@@ -359,7 +356,7 @@ impl UpdateBuilder {
     /// Set the authorization token or AWS credentials, used in requests to the S3 API
     ///
     /// For AWS S3 buckets that require authentication, provide credentials in the format "ACCESS_KEY:SECRET_KEY"
-    /// 
+    ///
     /// This is to support private S3 buckets where you need AWS credentials.
     /// **Make sure not to bake the credentials into your app**; it is recommended
     /// you obtain them via another mechanism, such as environment variables
@@ -618,10 +615,22 @@ fn fetch_releases_from_s3(
         .ok_or_else(|| Error::Config("`region` required".to_string()))?;
 
     #[cfg(feature = "aws-sdk")]
-    return fetch_releases_with_aws_sdk(end_point, bucket_name, region_str, asset_prefix, auth_token);
+    return fetch_releases_with_aws_sdk(
+        end_point,
+        bucket_name,
+        region_str,
+        asset_prefix,
+        auth_token,
+    );
 
     #[cfg(not(feature = "aws-sdk"))]
-    return fetch_releases_with_reqwest(end_point, bucket_name, region_str, asset_prefix, auth_token);
+    return fetch_releases_with_reqwest(
+        end_point,
+        bucket_name,
+        region_str,
+        asset_prefix,
+        auth_token,
+    );
 }
 
 #[cfg(feature = "aws-sdk")]
@@ -637,11 +646,18 @@ fn fetch_releases_with_aws_sdk(
         .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?;
 
     let config = runtime.block_on(async {
-        // Build AWS SDK configuration
-        let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(region.to_string()));
+        // Build AWS SDK configuration with the following credential sources (in order):
+        // 1. Explicit credentials from auth_token if provided
+        // 2. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+        // 3. AWS credential files (~/.aws/credentials)
+        // 4. IAM roles for Amazon EC2 / container credentials
+        let region_provider = Region::new(region.to_string());
 
-        // Configure credentials if provided
+        // Start with default config that loads credentials from all standard locations
+        let mut config_builder =
+            aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
+
+        // Configure explicit credentials if provided via auth_token
         if let Some(token) = auth_token {
             if token.contains(':') {
                 let mut parts = token.splitn(2, ':');
@@ -654,11 +670,12 @@ fn fetch_releases_with_aws_sdk(
                         "self-update",
                     );
                     config_builder = config_builder.credentials_provider(credentials);
-                    debug!("Using AWS credentials from auth_token");
+                    debug!("Using AWS credentials from auth_token parameter");
                 }
             }
         }
 
+        debug!("Loading AWS configuration from environment and credential files");
         config_builder.load().await
     });
 
@@ -668,34 +685,20 @@ fn fetch_releases_with_aws_sdk(
     // We'll directly use the list_objects_v2 method from the client below
     // No need to create a builder separately
 
-    // Execute the request in the runtime
-    let list_result = runtime.block_on(async {
-        s3_client.list_objects_v2()
-            .bucket(bucket_name)
-            .max_keys(MAX_KEYS)
-            .set_prefix(asset_prefix.clone())
-            .send()
-            .await
-    });
-
-    // Handle potential error
-    let list_output = match list_result {
-        Ok(output) => output,
-        Err(err) => {
-            bail!(Error::Network, "Failed to list S3 objects: {}", err);
-        }
-    };
+    // Build request parameters for debugging
+    let prefix_str = asset_prefix.as_ref().map_or("None", |s| s.as_str());
+    debug!(
+        "Making S3 list_objects_v2 request to bucket '{}' in region '{}' with prefix '{}'",
+        bucket_name, region, prefix_str
+    );
 
     // Get the endpoint URL for constructing download URLs
     let download_base_url = get_download_base_url(end_point, bucket_name, region)?;
-    
-    // Parse objects into releases
-    // The contents() method returns a slice directly, not an Option
-    let contents = list_output.contents();
     let mut releases = Vec::new();
-    
+    let mut continuation_token = None;
+
     // Create regex for parsing filenames to extract version information
-    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
+    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<n>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
         .map_err(|err| {
             Error::Release(format!(
                 "Failed constructing regex to parse S3 filenames: {}",
@@ -703,18 +706,78 @@ fn fetch_releases_with_aws_sdk(
             ))
         })?;
 
-    // Process each object
-    for obj in contents {
-        let key = match obj.key() {
-            Some(k) => k,
-            None => continue, // Skip objects without keys
+    // Execute the request in the runtime with pagination support
+    loop {
+        debug!(
+            "Making S3 list_objects_v2 request to bucket '{}' (page: {})",
+            bucket_name,
+            if continuation_token.is_some() {
+                "continuation"
+            } else {
+                "first"
+            }
+        );
+
+        let list_result = runtime.block_on(async {
+            let mut request = s3_client
+                .list_objects_v2()
+                .bucket(bucket_name)
+                .max_keys(MAX_KEYS);
+
+            // Only set prefix if specified
+            if let Some(prefix) = asset_prefix {
+                request = request.prefix(prefix);
+            }
+
+            // Add continuation token if we're not on the first page
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            request.send().await
+        });
+
+        // Handle potential error
+        let list_output = match list_result {
+            Ok(output) => output,
+            Err(err) => {
+                bail!(Error::Network, "Failed to list S3 objects: {}", err);
+            }
         };
-        
-        let last_modified = obj.last_modified()
-            .map(|dt| dt.to_string())
-            .unwrap_or_default();
-            
-        process_s3_object(key, &last_modified, &download_base_url, &regex, &mut releases)?;
+
+        // Process the current page of results
+        let contents = list_output.contents();
+
+        // Process objects in this page
+        for obj in contents {
+            let key = match obj.key() {
+                Some(k) => k,
+                None => continue, // Skip objects without keys
+            };
+
+            let last_modified = obj
+                .last_modified()
+                .map(|dt| dt.to_string())
+                .unwrap_or_default();
+
+            process_s3_object(
+                key,
+                &last_modified,
+                &download_base_url,
+                &regex,
+                &mut releases,
+            )?;
+        }
+
+        // Check if there are more pages
+        continuation_token = list_output.next_continuation_token().map(|s| s.to_string());
+
+        // If there's no continuation token, we've processed all pages
+        if continuation_token.is_none() {
+            break;
+        }
+
+        debug!("Fetching next page of S3 bucket contents");
     }
 
     Ok(releases)
@@ -722,11 +785,11 @@ fn fetch_releases_with_aws_sdk(
 
 #[cfg(feature = "aws-sdk")]
 fn process_s3_object(
-    key: &str, 
+    key: &str,
     last_modified: &str,
     download_base_url: &str,
     regex: &Regex,
-    releases: &mut Vec<Release>
+    releases: &mut Vec<Release>,
 ) -> Result<()> {
     // Extract filename from key
     let p = PathBuf::from(key);
@@ -745,36 +808,34 @@ fn process_s3_object(
             name: exe_name.to_string(),
             download_url: format!("{}{}", download_base_url, key),
         }];
-        
+
         debug!("Matched release from key {}: {:?}", key, &release);
         add_to_releases_list(releases, release);
     } else {
         debug!("Regex mismatch for key: {}", key);
     }
-    
+
     Ok(())
 }
 
 #[cfg(feature = "aws-sdk")]
 fn get_s3_client(end_point: EndPoint, config: &SdkConfig, region: &str) -> Result<S3Client> {
     Ok(match end_point {
-        EndPoint::S3 => {
-            S3Client::new(config)
-        },
+        EndPoint::S3 => S3Client::new(config),
         EndPoint::S3DualStack => {
             // Configure with dual-stack endpoint
             let s3_config = aws_sdk_s3::config::Builder::from(config)
                 .use_dual_stack(true)
                 .build();
             S3Client::from_conf(s3_config)
-        },
+        }
         EndPoint::GCS => {
             // For GCS, we use a custom endpoint
             let s3_config = aws_sdk_s3::config::Builder::from(config)
                 .endpoint_url("https://storage.googleapis.com")
                 .build();
             S3Client::from_conf(s3_config)
-        },
+        }
         EndPoint::DigitalOceanSpaces => {
             // For DigitalOcean Spaces, use their regional endpoint
             let endpoint_url = format!("https://{}.digitaloceanspaces.com", region);
@@ -794,13 +855,12 @@ fn get_download_base_url(end_point: EndPoint, bucket_name: &str, region: &str) -
             "https://{}.s3.dualstack.{}.amazonaws.com/",
             bucket_name, region
         ),
-        EndPoint::DigitalOceanSpaces => format!(
-            "https://{}.{}.digitaloceanspaces.com/",
-            bucket_name, region
-        ),
+        EndPoint::DigitalOceanSpaces => {
+            format!("https://{}.{}.digitaloceanspaces.com/", bucket_name, region)
+        }
         EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
     };
-    
+
     Ok(download_base_url)
 }
 
@@ -812,84 +872,9 @@ fn fetch_releases_with_reqwest(
     asset_prefix: &Option<String>,
     auth_token: &Option<String>,
 ) -> Result<Vec<Release>> {
-    let prefix = match asset_prefix {
-        Some(prefix) => format!("&prefix={}", prefix),
-        None => "".to_string(),
-    };
-
     let download_base_url = get_download_base_url(end_point, bucket_name, region)?;
-
-    let api_url = match end_point {
-        EndPoint::S3 | EndPoint::S3DualStack | EndPoint::DigitalOceanSpaces => format!(
-            "{}?list-type=2&max-keys={}{}",
-            download_base_url, MAX_KEYS, prefix
-        ),
-        EndPoint::GCS => format!("{}?max-keys={}{}", download_base_url, MAX_KEYS, prefix),
-    };
-
-    debug!("using api url: {:?}", api_url);
-
-    let client = reqwest::blocking::ClientBuilder::new()
-        .use_rustls_tls()
-        .http2_adaptive_window(true)
-        .build()?;
-    
-    // Build the request with authentication if provided
-    let mut request_builder = client.get(&api_url);
-    
-    // Apply authentication if provided
-    if let Some(token) = auth_token {
-        // Check if the token appears to be formatted as AWS credentials (access_key:secret_key)
-        if token.contains(':') {
-            let mut parts = token.splitn(2, ':');
-            if let (Some(access_key), Some(secret_key)) = (parts.next(), parts.next()) {
-                // For DigitalOcean Spaces, the auth header should be formatted as: "Authorization: AWS access_key:signature"
-                // For AWS S3, we'd ideally implement SigV4 signing, but that's complex without AWS SDK
-                // As a simpler approach, we'll just set the access key and secret as headers
-                // NOTE: This is a simplified approach and may not work with all S3-compatible services
-                let auth_header = format!("AWS {}", access_key);
-                request_builder = request_builder
-                    .header(reqwest::header::AUTHORIZATION, &auth_header)
-                    // Store the secret key as a custom header (some S3-compatible services accept this)
-                    .header("X-Amz-Secret-Key", secret_key);
-                
-                debug!("Using AWS authentication with provided credentials");
-            } else {
-                debug!("Malformed AWS credentials format, expected 'access_key:secret_key'");
-            }
-        } else {
-            // If it's not in the expected format, use it as a bearer token
-            request_builder = request_builder.bearer_auth(token);
-            debug!("Using bearer token authentication");
-        }
-    }
-    
-    // Send the request
-    let resp = request_builder.send()?;
-    
-    if !resp.status().is_success() {
-        bail!(
-            Error::Network,
-            "S3 API request failed with status: {:?} - for: {:?}",
-            resp.status(),
-            api_url
-        )
-    }
-
-    let body = resp.text()?;
-    let mut reader = Reader::from_str(&body);
-    reader.config_mut().trim_text(true);
-
-    // Let's now parse the response to extract the releases
-    enum Tag {
-        Contents,
-        Key,
-        LastModified,
-        Other,
-    }
-
-    let mut current_tag = Tag::Other;
-    let mut current_release: Option<Release> = None;
+    let mut releases = Vec::new();
+    let mut continuation_token = None;
     let regex =
         Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
             .map_err(|err| {
@@ -899,72 +884,187 @@ fn fetch_releases_with_reqwest(
                 ))
             })?;
 
-    // inspecting each XML element we populate our releases list
-    let mut buf = Vec::new();
-    let mut releases: Vec<Release> = vec![];
+    let client = reqwest::blocking::ClientBuilder::new()
+        .use_rustls_tls()
+        .http2_adaptive_window(true)
+        .build()?;
+
+    // Implement pagination for the standard S3 API
     loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name().into_inner() {
-                b"Contents" => {
-                    current_tag = Tag::Contents;
+        // Create the API URL with appropriate parameters
+        let mut params = vec![format!("list-type=2"), format!("max-keys={}", MAX_KEYS)];
+
+        // Add prefix if specified
+        if let Some(prefix) = asset_prefix {
+            params.push(format!("prefix={}", prefix));
+        }
+
+        // Add continuation token if we have one
+        if let Some(token) = &continuation_token {
+            params.push(format!("continuation-token={}", token));
+        }
+
+        // Build the complete URL
+        let api_url = match end_point {
+            EndPoint::S3 | EndPoint::S3DualStack | EndPoint::DigitalOceanSpaces => {
+                format!("{}?{}", download_base_url, params.join("&"))
+            }
+            EndPoint::GCS => format!(
+                "{}?{}",
+                download_base_url,
+                params.join("&").replace("list-type=2&", "")
+            ),
+        };
+
+        debug!(
+            "Using API URL: {:?} (page: {})",
+            api_url,
+            if continuation_token.is_some() {
+                "continuation"
+            } else {
+                "first"
+            }
+        );
+
+        // Build the request with authentication if provided
+        let mut request_builder = client.get(&api_url);
+
+        // Apply authentication if provided
+        if let Some(token) = auth_token {
+            // Check if the token appears to be formatted as AWS credentials
+            if token.contains(':') {
+                let mut parts = token.splitn(2, ':');
+                if let (Some(access_key), Some(secret_key)) = (parts.next(), parts.next()) {
+                    let auth_header = format!("AWS {}", access_key);
+                    request_builder = request_builder
+                        .header(reqwest::header::AUTHORIZATION, &auth_header)
+                        .header("X-Amz-Secret-Key", secret_key);
+
+                    debug!("Using AWS authentication with provided credentials");
+                } else {
+                    debug!("Malformed AWS credentials format, expected 'access_key:secret_key'");
+                }
+            } else {
+                // If it's not in the expected format, use it as a bearer token
+                request_builder = request_builder.bearer_auth(token);
+                debug!("Using bearer token authentication");
+            }
+        }
+
+        // Send the request
+        let resp = request_builder.send()?;
+
+        if !resp.status().is_success() {
+            bail!(
+                Error::Network,
+                "S3 API request failed with status: {:?} - for: {:?}",
+                resp.status(),
+                api_url
+            )
+        }
+
+        let body = resp.text()?;
+        let mut reader = Reader::from_str(&body);
+        reader.config_mut().trim_text(true);
+
+        // Parse the response to extract the releases
+        enum Tag {
+            Contents,
+            Key,
+            LastModified,
+            NextContinuationToken,
+            IsTruncated,
+            Other,
+        }
+
+        let mut current_tag = Tag::Other;
+        let mut current_release: Option<Release> = None;
+        let mut new_continuation_token = None;
+        let mut is_truncated = false;
+
+        // Process XML response
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => match e.name().into_inner() {
+                    b"Contents" => {
+                        current_tag = Tag::Contents;
+                        if let Some(release) = current_release {
+                            add_to_releases_list(&mut releases, release);
+                        }
+                        current_release = None;
+                    }
+                    b"Key" => current_tag = Tag::Key,
+                    b"LastModified" => current_tag = Tag::LastModified,
+                    b"NextContinuationToken" => current_tag = Tag::NextContinuationToken,
+                    b"IsTruncated" => current_tag = Tag::IsTruncated,
+                    _ => current_tag = Tag::Other,
+                },
+                Ok(Event::Text(e)) => {
+                    // If we cannot decode a tag text we just ignore it
+                    if let Ok(txt) = e.unescape().map(|r| r.into_owned()) {
+                        match current_tag {
+                            Tag::Key => {
+                                let p = PathBuf::from(&txt);
+                                let exe_name = match p.file_name().map(|v| v.to_str()) {
+                                    Some(Some(v)) => v,
+                                    _ => &txt,
+                                };
+
+                                if let Some(captures) = regex.captures(&txt) {
+                                    let release = current_release.get_or_insert(Release::default());
+                                    release.name = captures["name"].to_string();
+                                    release.version =
+                                        captures["version"].trim_start_matches('v').to_string();
+                                    release.assets = vec![ReleaseAsset {
+                                        name: exe_name.to_string(),
+                                        download_url: format!("{}{}", download_base_url, txt),
+                                    }];
+                                    debug!("Matched release: {:?}", release);
+                                } else {
+                                    debug!("Regex mismatch: {:?}", &txt);
+                                }
+                            }
+                            Tag::LastModified => {
+                                let release = current_release.get_or_insert(Release::default());
+                                release.date = txt;
+                            }
+                            Tag::NextContinuationToken => {
+                                new_continuation_token = Some(txt);
+                            }
+                            Tag::IsTruncated => {
+                                is_truncated = txt.to_lowercase() == "true";
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                Ok(Event::Eof) => {
                     if let Some(release) = current_release {
                         add_to_releases_list(&mut releases, release);
                     }
-                    current_release = None;
+                    break; // exits the loop when reaching end of file
                 }
-                b"Key" => current_tag = Tag::Key,
-                b"LastModified" => current_tag = Tag::LastModified,
-                _ => current_tag = Tag::Other,
-            },
-            Ok(Event::Text(e)) => {
-                // if we cannot decode a tag text we just ignore it
-                if let Ok(txt) = e.unescape().map(|r| r.into_owned()) {
-                    match current_tag {
-                        Tag::Key => {
-                            let p = PathBuf::from(&txt);
-                            let exe_name = match p.file_name().map(|v| v.to_str()) {
-                                Some(Some(v)) => v,
-                                _ => &txt,
-                            };
+                Err(e) => bail!(
+                    Error::Release,
+                    "Failed when parsing S3 XML response at position {}: {:?}",
+                    reader.buffer_position(),
+                    e
+                ),
+                _ => (), // There are several other `Event`s we ignore here
+            }
 
-                            if let Some(captures) = regex.captures(&txt) {
-                                let release = current_release.get_or_insert(Release::default());
-                                release.name = captures["name"].to_string();
-                                release.version =
-                                    captures["version"].trim_start_matches('v').to_string();
-                                release.assets = vec![ReleaseAsset {
-                                    name: exe_name.to_string(),
-                                    download_url: format!("{}{}", download_base_url, txt),
-                                }];
-                                debug!("Matched release: {:?}", release);
-                            } else {
-                                debug!("Regex mismatch: {:?}", &txt);
-                            }
-                        }
-                        Tag::LastModified => {
-                            let release = current_release.get_or_insert(Release::default());
-                            release.date = txt;
-                        }
-                        _ => (),
-                    }
-                }
-            }
-            Ok(Event::Eof) => {
-                if let Some(release) = current_release {
-                    add_to_releases_list(&mut releases, release);
-                }
-                break; // exits the loop when reaching end of file
-            }
-            Err(e) => bail!(
-                Error::Release,
-                "Failed when parsing S3 XML response at position {}: {:?}",
-                reader.buffer_position(),
-                e
-            ),
-            _ => (), // There are several other `Event`s we ignore here
+            buf.clear();
         }
 
-        buf.clear();
+        // If the response is not truncated or there's no continuation token, we're done
+        if !is_truncated || new_continuation_token.is_none() {
+            break;
+        }
+
+        // Update continuation token and fetch next page
+        continuation_token = new_continuation_token;
+        debug!("Fetching next page of S3 bucket contents");
     }
 
     Ok(releases)
