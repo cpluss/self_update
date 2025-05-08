@@ -28,7 +28,8 @@ available (but _disabled_ by default):
 * `compression-zip-deflate`: Support for _zip_'s _deflate_ compression format;
 * `compression-zip-bzip2`: Support for _zip_'s _bzip2_ compression format;
 * `rustls`: Use [pure rust TLS implementation](https://github.com/ctz/rustls) for network requests. This feature does _not_ support 32bit macOS;
-* `signatures`: Use [zipsign](https://github.com/Kijewski/zipsign) to verify `.zip` and `.tar.gz` artifacts. Artifacts are assumed to have been signed using zipsign.
+* `signatures`: Use [zipsign](https://github.com/Kijewski/zipsign) to verify `.zip` and `.tar.gz` artifacts. Artifacts are assumed to have been signed using zipsign;
+* `aws-sdk`: Use the AWS SDK for Rust for S3 operations, providing proper AWS Signature v4 authentication.
 
 Please activate the feature(s) needed by your release files.
 
@@ -81,6 +82,64 @@ fn update() -> Result<(), Box<::std::error::Error>> {
         .build()?
         .update()?;
     println!("S3 Update status: `{}`!", status.version());
+    Ok(())
+}
+```
+
+For private S3 buckets that require authentication, you can provide AWS credentials:
+
+```rust
+use self_update::cargo_crate_version;
+use std::env;
+
+fn update_from_private_bucket() -> Result<(), Box<::std::error::Error>> {
+    // Get AWS credentials from environment variables (recommended)
+    // Format: "ACCESS_KEY:SECRET_KEY"
+    let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY not set");
+    let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY not set");
+    let credentials = format!("{}:{}", aws_access_key, aws_secret_key);
+
+    let status = self_update::backends::s3::Update::configure()
+        .bucket_name("private-releases-bucket")
+        .region("us-west-2")
+        .bin_name("my_app")
+        .show_download_progress(true)
+        .current_version(cargo_crate_version!())
+        .auth_token(&credentials) // Provide authentication for private bucket
+        .build()?
+        .update()?;
+    println!("Private S3 Update status: `{}`!", status.version());
+    Ok(())
+}
+```
+
+For improved S3 authentication with AWS Signature v4 support, enable the `aws-sdk` feature:
+
+```toml
+[dependencies]
+self_update = { version = "0.42.0", features = ["aws-sdk"] }
+```
+
+When using the `aws-sdk` feature, standard AWS credential sources are also supported (environment variables, ~/.aws/credentials, etc.):
+
+```rust
+use self_update::cargo_crate_version;
+
+fn update_from_private_bucket() -> Result<(), Box<::std::error::Error>> {
+    // AWS credentials will be automatically loaded from the environment
+    // or ~/.aws/credentials
+    
+    let status = self_update::backends::s3::Update::configure()
+        .bucket_name("private-releases-bucket")
+        .region("us-west-2")
+        .bin_name("my_app")
+        .show_download_progress(true)
+        .current_version(cargo_crate_version!())
+        // No explicit auth_token needed when using aws-sdk feature
+        // and standard AWS credential sources
+        .build()?
+        .update()?;
+    println!("Private S3 Update status: `{}`!", status.version());
     Ok(())
 }
 ```

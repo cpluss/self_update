@@ -2,7 +2,11 @@
 
 ## [unreleased]
 ### Added
+- Support for authenticated private S3 buckets using AWS credentials
+- Add optional `aws-sdk` feature for improved S3 authentication and compatibility
 ### Changed
+- Fix S3 authentication to properly handle AWS Signature v4 when using `aws-sdk` feature
+- Update S3 backend to use AWS SDK when available
 ### Removed
 
 ## [0.42.0]

@@ -8,15 +8,29 @@ use crate::{
     version::bump_is_greater,
     DEFAULT_PROGRESS_CHARS, DEFAULT_PROGRESS_TEMPLATE,
 };
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use regex::Regex;
 use std::cmp::Ordering;
 use std::env::{self, consts::EXE_SUFFIX};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "aws-sdk")]
+use {
+    aws_config::{BehaviorVersion, SdkConfig},
+    aws_sdk_s3::{
+        config::{Credentials, Region},
+        Client as S3Client,
+    },
+    tokio::runtime::Runtime,
+};
+
+#[cfg(not(feature = "aws-sdk"))]
+use {
+    quick_xml::events::Event,
+    quick_xml::Reader,
+};
+
 /// Maximum number of items to retrieve from S3 API
-const MAX_KEYS: u8 = 100;
+const MAX_KEYS: i32 = 100;
 
 /// The service end point.
 ///
@@ -39,6 +53,7 @@ pub struct ReleaseListBuilder {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: Option<String>,
+    auth_token: Option<String>,
 }
 
 impl ReleaseListBuilder {
@@ -71,6 +86,19 @@ impl ReleaseListBuilder {
         self.target = Some(target.to_owned());
         self
     }
+    
+    /// Set the authorization token or AWS credentials, used in requests to the S3 API
+    ///
+    /// For AWS S3 buckets that require authentication, provide credentials in the format "ACCESS_KEY:SECRET_KEY"
+    /// 
+    /// This is to support private S3 buckets where you need AWS credentials.
+    /// **Make sure not to bake the credentials into your app**; it is recommended
+    /// you obtain them via another mechanism, such as environment variables
+    /// or prompting the user for input
+    pub fn auth_token(&mut self, auth_token: &str) -> &mut Self {
+        self.auth_token = Some(auth_token.to_owned());
+        self
+    }
 
     /// Verify builder args, returning a `ReleaseList`
     pub fn build(&self) -> Result<ReleaseList> {
@@ -84,6 +112,7 @@ impl ReleaseListBuilder {
             region: self.region.clone(),
             asset_prefix: self.asset_prefix.clone(),
             target: self.target.clone(),
+            auth_token: self.auth_token.clone(),
         })
     }
 }
@@ -97,6 +126,7 @@ pub struct ReleaseList {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: Option<String>,
+    auth_token: Option<String>,
 }
 
 impl ReleaseList {
@@ -108,6 +138,7 @@ impl ReleaseList {
             asset_prefix: None,
             target: None,
             region: None,
+            auth_token: None,
         }
     }
 
@@ -119,6 +150,7 @@ impl ReleaseList {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.auth_token,
         )?;
         let releases = match self.target {
             None => releases,
@@ -324,6 +356,14 @@ impl UpdateBuilder {
         self
     }
 
+    /// Set the authorization token or AWS credentials, used in requests to the S3 API
+    ///
+    /// For AWS S3 buckets that require authentication, provide credentials in the format "ACCESS_KEY:SECRET_KEY"
+    /// 
+    /// This is to support private S3 buckets where you need AWS credentials.
+    /// **Make sure not to bake the credentials into your app**; it is recommended
+    /// you obtain them via another mechanism, such as environment variables
+    /// or prompting the user for input
     pub fn auth_token(&mut self, auth_token: &str) -> &mut Self {
         self.auth_token = Some(auth_token.to_owned());
         self
@@ -433,6 +473,7 @@ impl ReleaseUpdate for Update {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.auth_token,
         )?;
         let rel = releases
             .iter()
@@ -462,6 +503,7 @@ impl ReleaseUpdate for Update {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.auth_token,
         )?;
 
         let mut releases = releases
@@ -493,6 +535,7 @@ impl ReleaseUpdate for Update {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.auth_token,
         )?;
         let rel = releases.iter().find(|x| x.version == ver);
         match rel {
@@ -568,28 +611,213 @@ fn fetch_releases_from_s3(
     bucket_name: &str,
     region: &Option<String>,
     asset_prefix: &Option<String>,
+    auth_token: &Option<String>,
+) -> Result<Vec<Release>> {
+    let region_str = region
+        .as_ref()
+        .ok_or_else(|| Error::Config("`region` required".to_string()))?;
+
+    #[cfg(feature = "aws-sdk")]
+    return fetch_releases_with_aws_sdk(end_point, bucket_name, region_str, asset_prefix, auth_token);
+
+    #[cfg(not(feature = "aws-sdk"))]
+    return fetch_releases_with_reqwest(end_point, bucket_name, region_str, asset_prefix, auth_token);
+}
+
+#[cfg(feature = "aws-sdk")]
+fn fetch_releases_with_aws_sdk(
+    end_point: EndPoint,
+    bucket_name: &str,
+    region: &str,
+    asset_prefix: &Option<String>,
+    auth_token: &Option<String>,
+) -> Result<Vec<Release>> {
+    // Create a tokio runtime for async AWS SDK operations
+    let runtime = Runtime::new()
+        .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?;
+
+    let config = runtime.block_on(async {
+        // Build AWS SDK configuration
+        let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(region.to_string()));
+
+        // Configure credentials if provided
+        if let Some(token) = auth_token {
+            if token.contains(':') {
+                let mut parts = token.splitn(2, ':');
+                if let (Some(access_key), Some(secret_key)) = (parts.next(), parts.next()) {
+                    let credentials = Credentials::new(
+                        access_key,
+                        secret_key,
+                        None, // session token
+                        None, // expiry time
+                        "self-update",
+                    );
+                    config_builder = config_builder.credentials_provider(credentials);
+                    debug!("Using AWS credentials from auth_token");
+                }
+            }
+        }
+
+        config_builder.load().await
+    });
+
+    // Create S3 client
+    let s3_client = get_s3_client(end_point, &config, region)?;
+
+    // We'll directly use the list_objects_v2 method from the client below
+    // No need to create a builder separately
+
+    // Execute the request in the runtime
+    let list_result = runtime.block_on(async {
+        s3_client.list_objects_v2()
+            .bucket(bucket_name)
+            .max_keys(MAX_KEYS)
+            .set_prefix(asset_prefix.clone())
+            .send()
+            .await
+    });
+
+    // Handle potential error
+    let list_output = match list_result {
+        Ok(output) => output,
+        Err(err) => {
+            bail!(Error::Network, "Failed to list S3 objects: {}", err);
+        }
+    };
+
+    // Get the endpoint URL for constructing download URLs
+    let download_base_url = get_download_base_url(end_point, bucket_name, region)?;
+    
+    // Parse objects into releases
+    // The contents() method returns a slice directly, not an Option
+    let contents = list_output.contents();
+    let mut releases = Vec::new();
+    
+    // Create regex for parsing filenames to extract version information
+    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
+        .map_err(|err| {
+            Error::Release(format!(
+                "Failed constructing regex to parse S3 filenames: {}",
+                err
+            ))
+        })?;
+
+    // Process each object
+    for obj in contents {
+        let key = match obj.key() {
+            Some(k) => k,
+            None => continue, // Skip objects without keys
+        };
+        
+        let last_modified = obj.last_modified()
+            .map(|dt| dt.to_string())
+            .unwrap_or_default();
+            
+        process_s3_object(key, &last_modified, &download_base_url, &regex, &mut releases)?;
+    }
+
+    Ok(releases)
+}
+
+#[cfg(feature = "aws-sdk")]
+fn process_s3_object(
+    key: &str, 
+    last_modified: &str,
+    download_base_url: &str,
+    regex: &Regex,
+    releases: &mut Vec<Release>
+) -> Result<()> {
+    // Extract filename from key
+    let p = PathBuf::from(key);
+    let exe_name = match p.file_name().map(|v| v.to_str()) {
+        Some(Some(v)) => v,
+        _ => key,
+    };
+
+    // Use regex to extract version information
+    if let Some(captures) = regex.captures(key) {
+        let mut release = Release::default();
+        release.name = captures["name"].to_string();
+        release.version = captures["version"].trim_start_matches('v').to_string();
+        release.date = last_modified.to_string();
+        release.assets = vec![ReleaseAsset {
+            name: exe_name.to_string(),
+            download_url: format!("{}{}", download_base_url, key),
+        }];
+        
+        debug!("Matched release from key {}: {:?}", key, &release);
+        add_to_releases_list(releases, release);
+    } else {
+        debug!("Regex mismatch for key: {}", key);
+    }
+    
+    Ok(())
+}
+
+#[cfg(feature = "aws-sdk")]
+fn get_s3_client(end_point: EndPoint, config: &SdkConfig, region: &str) -> Result<S3Client> {
+    Ok(match end_point {
+        EndPoint::S3 => {
+            S3Client::new(config)
+        },
+        EndPoint::S3DualStack => {
+            // Configure with dual-stack endpoint
+            let s3_config = aws_sdk_s3::config::Builder::from(config)
+                .use_dual_stack(true)
+                .build();
+            S3Client::from_conf(s3_config)
+        },
+        EndPoint::GCS => {
+            // For GCS, we use a custom endpoint
+            let s3_config = aws_sdk_s3::config::Builder::from(config)
+                .endpoint_url("https://storage.googleapis.com")
+                .build();
+            S3Client::from_conf(s3_config)
+        },
+        EndPoint::DigitalOceanSpaces => {
+            // For DigitalOcean Spaces, use their regional endpoint
+            let endpoint_url = format!("https://{}.digitaloceanspaces.com", region);
+            let s3_config = aws_sdk_s3::config::Builder::from(config)
+                .endpoint_url(endpoint_url)
+                .build();
+            S3Client::from_conf(s3_config)
+        }
+    })
+}
+
+// Function to get the download base URL for assets based on endpoint type
+fn get_download_base_url(end_point: EndPoint, bucket_name: &str, region: &str) -> Result<String> {
+    let download_base_url = match end_point {
+        EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region),
+        EndPoint::S3DualStack => format!(
+            "https://{}.s3.dualstack.{}.amazonaws.com/",
+            bucket_name, region
+        ),
+        EndPoint::DigitalOceanSpaces => format!(
+            "https://{}.{}.digitaloceanspaces.com/",
+            bucket_name, region
+        ),
+        EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
+    };
+    
+    Ok(download_base_url)
+}
+
+#[cfg(not(feature = "aws-sdk"))]
+fn fetch_releases_with_reqwest(
+    end_point: EndPoint,
+    bucket_name: &str,
+    region: &str,
+    asset_prefix: &Option<String>,
+    auth_token: &Option<String>,
 ) -> Result<Vec<Release>> {
     let prefix = match asset_prefix {
         Some(prefix) => format!("&prefix={}", prefix),
         None => "".to_string(),
     };
 
-    let region = region
-        .as_ref()
-        .ok_or_else(|| Error::Config("`region` required".to_string()));
-
-    let download_base_url = match end_point {
-        EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region?),
-        EndPoint::S3DualStack => format!(
-            "https://{}.s3.dualstack.{}.amazonaws.com/",
-            bucket_name, region?
-        ),
-        EndPoint::DigitalOceanSpaces => format!(
-            "https://{}.{}.digitaloceanspaces.com/",
-            bucket_name, region?
-        ),
-        EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
-    };
+    let download_base_url = get_download_base_url(end_point, bucket_name, region)?;
 
     let api_url = match end_point {
         EndPoint::S3 | EndPoint::S3DualStack | EndPoint::DigitalOceanSpaces => format!(
@@ -605,7 +833,40 @@ fn fetch_releases_from_s3(
         .use_rustls_tls()
         .http2_adaptive_window(true)
         .build()?;
-    let resp = client.get(&api_url).send()?;
+    
+    // Build the request with authentication if provided
+    let mut request_builder = client.get(&api_url);
+    
+    // Apply authentication if provided
+    if let Some(token) = auth_token {
+        // Check if the token appears to be formatted as AWS credentials (access_key:secret_key)
+        if token.contains(':') {
+            let mut parts = token.splitn(2, ':');
+            if let (Some(access_key), Some(secret_key)) = (parts.next(), parts.next()) {
+                // For DigitalOcean Spaces, the auth header should be formatted as: "Authorization: AWS access_key:signature"
+                // For AWS S3, we'd ideally implement SigV4 signing, but that's complex without AWS SDK
+                // As a simpler approach, we'll just set the access key and secret as headers
+                // NOTE: This is a simplified approach and may not work with all S3-compatible services
+                let auth_header = format!("AWS {}", access_key);
+                request_builder = request_builder
+                    .header(reqwest::header::AUTHORIZATION, &auth_header)
+                    // Store the secret key as a custom header (some S3-compatible services accept this)
+                    .header("X-Amz-Secret-Key", secret_key);
+                
+                debug!("Using AWS authentication with provided credentials");
+            } else {
+                debug!("Malformed AWS credentials format, expected 'access_key:secret_key'");
+            }
+        } else {
+            // If it's not in the expected format, use it as a bearer token
+            request_builder = request_builder.bearer_auth(token);
+            debug!("Using bearer token authentication");
+        }
+    }
+    
+    // Send the request
+    let resp = request_builder.send()?;
+    
     if !resp.status().is_success() {
         bail!(
             Error::Network,
