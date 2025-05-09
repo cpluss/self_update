@@ -611,73 +611,89 @@ impl<'a> Move<'a> {
     }
 }
 
-/// Download things into files
+/// Enum of different downloaders supporting various URL schemes
+#[derive(Debug)]
+pub enum DownloaderImpl {
+    Http(HttpDownloader),
+    S3(S3Downloader),
+}
+
+impl DownloaderImpl {
+    /// Create appropriate downloader based on URL scheme
+    pub fn from_url(
+        url: &str,
+        show_progress: bool,
+        headers: reqwest::header::HeaderMap,
+        progress_template: String,
+        progress_chars: String,
+        auth_token: Option<String>,
+    ) -> Self {
+        if url.starts_with("s3://") {
+            DownloaderImpl::S3(S3Downloader::new(
+                url.to_owned(),
+                show_progress,
+                auth_token,
+                progress_template,
+                progress_chars,
+            ))
+        } else {
+            DownloaderImpl::Http(HttpDownloader {
+                show_progress,
+                url: url.to_owned(),
+                headers,
+                progress_template,
+                progress_chars,
+            })
+        }
+    }
+
+    /// Download content to the specified destination
+    pub fn download_to<T: io::Write>(&self, dest: T) -> Result<()> {
+        match self {
+            DownloaderImpl::Http(http) => http.download_to(dest),
+            DownloaderImpl::S3(s3) => s3.download_to(dest),
+        }
+    }
+}
+
+/// Download things into files via HTTP/HTTPS
 ///
 /// With optional progress bar
 #[derive(Debug)]
-pub struct Download {
+pub struct HttpDownloader {
     show_progress: bool,
     url: String,
     headers: reqwest::header::HeaderMap,
     progress_template: String,
     progress_chars: String,
 }
-impl Download {
-    /// Specify download url
-    pub fn from_url(url: &str) -> Self {
+
+/// Download things from S3 buckets
+#[derive(Debug)]
+pub struct S3Downloader {
+    show_progress: bool,
+    url: String,
+    auth_token: Option<String>,
+    progress_template: String,
+    progress_chars: String,
+}
+
+impl S3Downloader {
+    /// Create a new S3 downloader
+    pub fn new(url: String, show_progress: bool, auth_token: Option<String>,
+               progress_template: String, progress_chars: String) -> Self {
         Self {
-            show_progress: false,
-            url: url.to_owned(),
-            headers: reqwest::header::HeaderMap::new(),
-            progress_template: DEFAULT_PROGRESS_TEMPLATE.to_string(),
-            progress_chars: DEFAULT_PROGRESS_CHARS.to_string(),
+            show_progress,
+            url,
+            auth_token,
+            progress_template,
+            progress_chars,
         }
     }
+}
 
-    /// Toggle download progress bar
-    pub fn show_progress(&mut self, b: bool) -> &mut Self {
-        self.show_progress = b;
-        self
-    }
-
-    /// Set the progress style
-    pub fn set_progress_style(
-        &mut self,
-        progress_template: String,
-        progress_chars: String,
-    ) -> &mut Self {
-        self.progress_template = progress_template;
-        self.progress_chars = progress_chars;
-        self
-    }
-
-    /// Set the download request headers, replaces the existing `HeaderMap`
-    pub fn set_headers(&mut self, headers: reqwest::header::HeaderMap) -> &mut Self {
-        self.headers = headers;
-        self
-    }
-
-    /// Set a download request header, inserts into the existing `HeaderMap`
-    pub fn set_header(
-        &mut self,
-        name: reqwest::header::HeaderName,
-        value: reqwest::header::HeaderValue,
-    ) -> &mut Self {
-        self.headers.insert(name, value);
-        self
-    }
-
-    /// Download the file behind the given `url` into the specified `dest`.
-    /// Show a sliding progress bar if specified.
-    /// If the resource doesn't specify a content-length, the progress bar will not be shown
-    ///
-    /// * Errors:
-    ///     * `reqwest` network errors
-    ///     * Unsuccessful response status
-    ///     * Progress-bar errors
-    ///     * Reading from response to `BufReader`-buffer
-    ///     * Writing from `BufReader`-buffer to `File`
-    pub fn download_to<T: io::Write>(&self, mut dest: T) -> Result<()> {
+impl HttpDownloader {
+    fn download_to<T: io::Write>(&self, mut dest: T) -> Result<()> {
         use io::BufRead;
         let mut headers = self.headers.clone();
         if !headers.contains_key(header::USER_AGENT) {
@@ -748,6 +764,250 @@ impl Download {
             bar.finish_with_message("Done");
         }
         Ok(())
+    }
+}
+
+impl S3Downloader {
+    fn download_to<T: io::Write>(&self, mut dest: T) -> Result<()> {
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::{config::Region, Client as S3Client};
+        use tokio::runtime::Runtime;
+        use std::io::Read;
+
+        // Parse the S3 URL to extract bucket, region, and key
+        // Format: s3://bucket.s3.region.amazonaws.com/key
+        let s3_url = self.url.strip_prefix("s3://").ok_or_else(||
+            Error::Update("Invalid S3 URL format".to_string()))?;
+
+        // Split into host and path
+        let mut parts = s3_url.splitn(2, '/');
+        let host = parts.next().ok_or_else(||
+            Error::Update("Invalid S3 URL: missing host".to_string()))?;
+        let key = parts.next().ok_or_else(||
+            Error::Update("Invalid S3 URL: missing key".to_string()))?;
+
+        // Extract bucket name and region from host
+        // Format: bucket.s3.region.amazonaws.com
+        let host_parts: Vec<&str> = host.split('.').collect();
+        if host_parts.len() < 5 {
+            return Err(Error::Update("Invalid S3 URL: could not parse host".to_string()));
+        }
+
+        let bucket_name = host_parts[0];
+        let region = host_parts[2];
+
+        debug!("Downloading from S3: bucket={}, region={}, key={}", bucket_name, region, key);
+
+        // Create tokio runtime for async AWS SDK operations
+        let runtime = Runtime::new()
+            .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?;
+
+        // Create AWS configuration
+        let config = runtime.block_on(async {
+            let region_provider = Region::new(region.to_string());
+            let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
+                .region(region_provider);
+
+            // Apply credentials if provided
+            if let Some(auth) = &self.auth_token {
+                if auth.contains(':') {
+                    let parts: Vec<&str> = auth.split(':').collect();
+                    if parts.len() >= 2 {
+                        let access_key = parts[0];
+                        let secret_key = parts[1];
+
+                        debug!("Using provided AWS credentials");
+                        use aws_sdk_s3::config::Credentials;
+
+                        let credentials = Credentials::new(
+                            access_key,
+                            secret_key,
+                            None,
+                            None,
+                            "self_update-provided",
+                        );
+
+                        config_builder = config_builder.credentials_provider(credentials);
+                    }
+                }
+            }
+
+            config_builder.load().await
+        });
+
+        // Create S3 client
+        let s3_client = S3Client::new(&config);
+
+        // Set up progress bar if needed
+        let show_progress = self.show_progress;
+        let mut downloaded: u64 = 0;
+        let mut bar = None;
+
+        // Get object size first (if we want a progress bar)
+        let size = if show_progress {
+            runtime.block_on(async {
+                match s3_client.head_object()
+                    .bucket(bucket_name)
+                    .key(key)
+                    .send()
+                    .await {
+                    Ok(resp) => resp.content_length().unwrap_or(0),
+                    Err(_) => 0,
+                }
+            })
+        } else {
+            0
+        };
+
+        if show_progress && size > 0 {
+            let pb = ProgressBar::new(size as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(&self.progress_template)
+                    .expect("set ProgressStyle template failed")
+                    .progress_chars(&self.progress_chars),
+            );
+            bar = Some(pb);
+        }
+
+        // Download the object
+        let result = runtime.block_on(async {
+            let resp = match s3_client.get_object()
+                .bucket(bucket_name)
+                .key(key)
+                .send()
+                .await {
+                Ok(resp) => resp,
+                Err(err) => return Err(Error::Network(format!("Failed to get S3 object: {}", err))),
+            };
+
+            // Use AWS SDK to get the full bytes
+            let bytes = match resp.body.collect().await {
+                Ok(bytes) => bytes,
+                Err(err) => return Err(Error::Network(format!("Failed to collect S3 object bytes: {}", err))),
+            };
+
+            // Create a cursor to read from the bytes
+            use std::io::Cursor;
+            let mut cursor = Cursor::new(bytes.to_vec());
+            let mut buffer = [0u8; 8192]; // 8KB buffer
+
+            // Read from the cursor in chunks
+            loop {
+                let bytes_read = match cursor.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => n,
+                    Err(e) => return Err(Error::Io(e)),
+                };
+
+                // Write to destination
+                if let Err(e) = dest.write_all(&buffer[..bytes_read]) {
+                    return Err(Error::Io(e));
+                }
+
+                downloaded += bytes_read as u64;
+                if let Some(ref pb) = bar {
+                    pb.set_position(downloaded);
+                }
+            }
+
+            Ok(())
+        });
+
+        if let Some(ref pb) = bar {
+            pb.finish_with_message("Done");
+        }
+
+        result
+    }
+}
+
+/// Download things into files
+///
+/// With optional progress bar
+#[derive(Debug)]
+pub struct Download {
+    show_progress: bool,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    progress_template: String,
+    progress_chars: String,
+    auth_token: Option<String>,
+}
+
+impl Download {
+    /// Specify download url
+    pub fn from_url(url: &str) -> Self {
+        Self {
+            show_progress: false,
+            url: url.to_owned(),
+            headers: reqwest::header::HeaderMap::new(),
+            progress_template: DEFAULT_PROGRESS_TEMPLATE.to_string(),
+            progress_chars: DEFAULT_PROGRESS_CHARS.to_string(),
+            auth_token: None,
+        }
+    }
+
+    /// Toggle download progress bar
+    pub fn show_progress(&mut self, b: bool) -> &mut Self {
+        self.show_progress = b;
+        self
+    }
+
+    /// Set the progress style
+    pub fn set_progress_style(
+        &mut self,
+        progress_template: String,
+        progress_chars: String,
+    ) -> &mut Self {
+        self.progress_template = progress_template;
+        self.progress_chars = progress_chars;
+        self
+    }
+
+    /// Set the download request headers, replaces the existing `HeaderMap`
+    pub fn set_headers(&mut self, headers: reqwest::header::HeaderMap) -> &mut Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set a download request header, inserts into the existing `HeaderMap`
+    pub fn set_header(
+        &mut self,
+        name: reqwest::header::HeaderName,
+        value: reqwest::header::HeaderValue,
+    ) -> &mut Self {
+        self.headers.insert(name, value);
+        self
+    }
+
+    /// Set auth token for S3 authentication
+    pub fn set_auth_token(&mut self, auth_token: Option<String>) -> &mut Self {
+        self.auth_token = auth_token;
+        self
+    }
+
+    /// Download the file behind the given `url` into the specified `dest`.
+    /// Show a sliding progress bar if specified.
+    /// If the resource doesn't specify a content-length, the progress bar will not be shown
+    ///
+    /// * Errors:
+    ///     * `reqwest` network errors
+    ///     * Unsuccessful response status
+    ///     * Progress-bar errors
+    ///     * Reading from response to `BufReader`-buffer
+    ///     * Writing from `BufReader`-buffer to `File`
+    pub fn download_to<T: io::Write>(&self, dest: T) -> Result<()> {
+        let downloader = DownloaderImpl::from_url(
+            &self.url,
+            self.show_progress,
+            self.headers.clone(),
+            self.progress_template.clone(),
+            self.progress_chars.clone(),
+            self.auth_token.clone(),
+        );
+
+        downloader.download_to(dest)
     }
 }
 

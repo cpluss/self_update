@@ -271,6 +271,7 @@ pub trait ReleaseUpdate {
         let mut headers = self.api_headers(&self.auth_token())?;
         headers.insert(header::ACCEPT, "application/octet-stream".parse().unwrap());
         download.set_headers(headers);
+        download.set_auth_token(self.auth_token());
         download.show_progress(self.show_download_progress());
 
         download.progress_template = self.progress_template();
