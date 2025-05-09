@@ -698,7 +698,7 @@ fn fetch_releases_with_aws_sdk(
     let mut continuation_token = None;
 
     // Create regex for parsing filenames to extract version information
-    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<n>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
+    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
         .map_err(|err| {
             Error::Release(format!(
                 "Failed constructing regex to parse S3 filenames: {}",
