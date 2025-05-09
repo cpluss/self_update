@@ -58,19 +58,32 @@ impl Release {
         self.assets.iter().any(|asset| asset.name.contains(target))
     }
 
-    /// Return the first `ReleaseAsset` for the current release who's name
+    /// Return the `ReleaseAsset` for the current release whose name
     /// contains the specified `target` and possibly `identifier`
-    pub fn asset_for(&self, target: &str, identifier: Option<&str>) -> Option<ReleaseAsset> {
+    /// When bin_name is specified, it's also used as a matching criterion
+    pub fn asset_for(&self, target: &str, identifier: Option<&str>, bin_name: Option<&str>) -> Option<ReleaseAsset> {
         self.assets
             .iter()
             .find(|asset| {
-                (asset.name.contains(target)
-                    || (asset.name.contains(OS) && asset.name.contains(ARCH)))
-                    && if let Some(i) = identifier {
-                        asset.name.contains(i)
-                    } else {
-                        true
-                    }
+                // Check if asset contains target or OS/ARCH info
+                let target_match = asset.name.contains(target) ||
+                                  (asset.name.contains(OS) && asset.name.contains(ARCH));
+
+                // Check if asset contains identifier if specified
+                let identifier_match = if let Some(i) = identifier {
+                    asset.name.contains(i)
+                } else {
+                    true
+                };
+
+                // Check if asset contains bin_name if specified
+                let bin_name_match = if let Some(name) = bin_name {
+                    asset.name.contains(name)
+                } else {
+                    true
+                };
+
+                target_match && identifier_match && bin_name_match
             })
             .cloned()
     }
@@ -245,7 +258,7 @@ pub trait ReleaseUpdate {
         };
 
         let target_asset = release
-            .asset_for(&target, self.identifier().as_deref())
+            .asset_for(&target, self.identifier().as_deref(), Some(&self.bin_name()))
             .ok_or_else(|| {
                 format_err!(Error::Release, "No asset found for target: `{}`", target)
             })?;
