@@ -142,14 +142,14 @@ pub use tempfile::TempDir;
 #[cfg(feature = "compression-flate2")]
 use either::Either;
 use indicatif::{ProgressBar, ProgressStyle};
+use once_cell::sync::Lazy;
 use reqwest::header;
 use std::cmp::min;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
 
 #[macro_use]
 extern crate log;
@@ -703,8 +703,13 @@ pub struct S3Downloader {
 
 impl S3Downloader {
     /// Create a new S3 downloader
-    pub fn new(url: String, show_progress: bool, auth_token: Option<String>,
-               progress_template: String, progress_chars: String) -> Self {
+    pub fn new(
+        url: String,
+        show_progress: bool,
+        auth_token: Option<String>,
+        progress_template: String,
+        progress_chars: String,
+    ) -> Self {
         Self {
             show_progress,
             url,
@@ -718,21 +723,26 @@ impl S3Downloader {
     fn parse_s3_url(url: &str) -> Result<S3Url> {
         // Parse the S3 URL to extract bucket, region, and key
         // Format: s3://bucket.s3.region.amazonaws.com/key
-        let s3_url = url.strip_prefix("s3://").ok_or_else(||
-            Error::Update("Invalid S3 URL format".to_string()))?;
+        let s3_url = url
+            .strip_prefix("s3://")
+            .ok_or_else(|| Error::Update("Invalid S3 URL format".to_string()))?;
 
         // Split into host and path
         let mut parts = s3_url.splitn(2, '/');
-        let host = parts.next().ok_or_else(||
-            Error::Update("Invalid S3 URL: missing host".to_string()))?;
-        let key = parts.next().ok_or_else(||
-            Error::Update("Invalid S3 URL: missing key".to_string()))?;
+        let host = parts
+            .next()
+            .ok_or_else(|| Error::Update("Invalid S3 URL: missing host".to_string()))?;
+        let key = parts
+            .next()
+            .ok_or_else(|| Error::Update("Invalid S3 URL: missing key".to_string()))?;
 
         // Extract bucket name and region from host
         // Format: bucket.s3.region.amazonaws.com
         let host_parts: Vec<&str> = host.split('.').collect();
         if host_parts.len() < 5 {
-            return Err(Error::Update("Invalid S3 URL: could not parse host".to_string()));
+            return Err(Error::Update(
+                "Invalid S3 URL: could not parse host".to_string(),
+            ));
         }
 
         let bucket = host_parts[0].to_string();
@@ -746,7 +756,10 @@ impl S3Downloader {
     }
 
     /// Get or create S3 client for a region and auth token
-    fn get_or_create_client(region: &str, auth_token: &Option<String>) -> Result<std::sync::Arc<S3ClientWithRuntime>> {
+    fn get_or_create_client(
+        region: &str,
+        auth_token: &Option<String>,
+    ) -> Result<std::sync::Arc<S3ClientWithRuntime>> {
         use aws_config::BehaviorVersion;
         use aws_sdk_s3::{config::Region, Client as S3Client};
         use tokio::runtime::Runtime;
@@ -761,7 +774,11 @@ impl S3Downloader {
         {
             let cache = match S3_CLIENT_CACHE.lock() {
                 Ok(cache) => cache,
-                Err(_) => return Err(Error::Update("Failed to acquire S3 client cache lock".to_string())),
+                Err(_) => {
+                    return Err(Error::Update(
+                        "Failed to acquire S3 client cache lock".to_string(),
+                    ))
+                }
             };
 
             if let Some(client_wrapper) = cache.get(&cache_key) {
@@ -774,14 +791,14 @@ impl S3Downloader {
         debug!("Creating new S3 client for region: {}", region);
         let runtime = std::sync::Arc::new(
             Runtime::new()
-                .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?
+                .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?,
         );
 
         // Create AWS configuration
         let config = runtime.block_on(async {
             let region_provider = Region::new(region.to_string());
-            let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
-                .region(region_provider);
+            let mut config_builder =
+                aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
 
             // Apply credentials if provided
             if let Some(auth) = auth_token {
@@ -814,16 +831,17 @@ impl S3Downloader {
         let client = S3Client::new(&config);
 
         // Create wrapper and store in cache
-        let client_wrapper = std::sync::Arc::new(S3ClientWithRuntime {
-            client,
-            runtime,
-        });
+        let client_wrapper = std::sync::Arc::new(S3ClientWithRuntime { client, runtime });
 
         // Update cache
         {
             let mut cache = match S3_CLIENT_CACHE.lock() {
                 Ok(cache) => cache,
-                Err(_) => return Err(Error::Update("Failed to acquire S3 client cache lock".to_string())),
+                Err(_) => {
+                    return Err(Error::Update(
+                        "Failed to acquire S3 client cache lock".to_string(),
+                    ))
+                }
             };
 
             cache.insert(cache_key, std::sync::Arc::clone(&client_wrapper));
@@ -915,8 +933,10 @@ impl S3Downloader {
         // Parse the S3 URL
         let s3_url = Self::parse_s3_url(&self.url)?;
 
-        debug!("Downloading from S3: bucket={}, region={}, key={}",
-               s3_url.bucket, s3_url.region, s3_url.key);
+        debug!(
+            "Downloading from S3: bucket={}, region={}, key={}",
+            s3_url.bucket, s3_url.region, s3_url.key
+        );
 
         // Get or create S3 client (reuse from cache if available)
         let client_wrapper = Self::get_or_create_client(&s3_url.region, &self.auth_token)?;
@@ -933,11 +953,13 @@ impl S3Downloader {
         // Get object size first (if we want a progress bar)
         let size = if show_progress {
             runtime.block_on(async {
-                match s3_client.head_object()
+                match s3_client
+                    .head_object()
                     .bucket(&s3_url.bucket)
                     .key(&s3_url.key)
                     .send()
-                    .await {
+                    .await
+                {
                     Ok(resp) => resp.content_length().unwrap_or(0),
                     Err(_) => 0,
                 }
@@ -959,19 +981,28 @@ impl S3Downloader {
 
         // Download the object
         let result = runtime.block_on(async {
-            let resp = match s3_client.get_object()
+            let resp = match s3_client
+                .get_object()
                 .bucket(&s3_url.bucket)
                 .key(&s3_url.key)
                 .send()
-                .await {
+                .await
+            {
                 Ok(resp) => resp,
-                Err(err) => return Err(Error::Network(format!("Failed to get S3 object: {}", err))),
+                Err(err) => {
+                    return Err(Error::Network(format!("Failed to get S3 object: {}", err)))
+                }
             };
 
             // Use AWS SDK to get the full bytes
             let bytes = match resp.body.collect().await {
                 Ok(bytes) => bytes,
-                Err(err) => return Err(Error::Network(format!("Failed to collect S3 object bytes: {}", err))),
+                Err(err) => {
+                    return Err(Error::Network(format!(
+                        "Failed to collect S3 object bytes: {}",
+                        err
+                    )))
+                }
             };
 
             // Create a cursor to read from the bytes

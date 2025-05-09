@@ -14,10 +14,7 @@ use std::env::{self, consts::EXE_SUFFIX};
 use std::path::{Path, PathBuf};
 
 use aws_config::{BehaviorVersion, SdkConfig};
-use aws_sdk_s3::{
-    config::Region,
-    Client as S3Client,
-};
+use aws_sdk_s3::{config::Region, Client as S3Client};
 use tokio::runtime::Runtime;
 
 /// Maximum number of items to retrieve from S3 API
@@ -34,6 +31,51 @@ pub enum EndPoint {
     S3DualStack,
     GCS,
     DigitalOceanSpaces,
+}
+
+impl EndPoint {
+    /// Generate the appropriate download base URL for this endpoint
+    fn download_base_url(&self, bucket_name: &str, region: &str) -> String {
+        match self {
+            EndPoint::S3 => format!("{}.s3.{}.amazonaws.com", bucket_name, region),
+            EndPoint::S3DualStack => {
+                format!("{}.s3.dualstack.{}.amazonaws.com", bucket_name, region)
+            }
+            EndPoint::GCS => format!("{}.storage.googleapis.com", bucket_name),
+            EndPoint::DigitalOceanSpaces => {
+                format!("{}.{}.digitaloceanspaces.com", bucket_name, region)
+            }
+        }
+    }
+
+    /// Create the appropriate S3 client for this endpoint type
+    fn create_client(&self, config: &SdkConfig, region: &str) -> S3Client {
+        match self {
+            EndPoint::S3 => S3Client::new(config),
+            EndPoint::S3DualStack => {
+                // Configure with dual-stack endpoint
+                let s3_config = aws_sdk_s3::config::Builder::from(config)
+                    .use_dual_stack(true)
+                    .build();
+                S3Client::from_conf(s3_config)
+            }
+            EndPoint::GCS => {
+                // For GCS, we use a custom endpoint
+                let s3_config = aws_sdk_s3::config::Builder::from(config)
+                    .endpoint_url("https://storage.googleapis.com")
+                    .build();
+                S3Client::from_conf(s3_config)
+            }
+            EndPoint::DigitalOceanSpaces => {
+                // For DigitalOcean Spaces, use their regional endpoint
+                let endpoint_url = format!("https://{}.digitaloceanspaces.com", region);
+                let s3_config = aws_sdk_s3::config::Builder::from(config)
+                    .endpoint_url(endpoint_url)
+                    .build();
+                S3Client::from_conf(s3_config)
+            }
+        }
+    }
 }
 
 /// `ReleaseList` Builder
@@ -93,13 +135,14 @@ impl ReleaseListBuilder {
 
     /// Verify builder args, returning a `ReleaseList`
     pub fn build(&self) -> Result<ReleaseList> {
+        let bucket_name = self
+            .bucket_name
+            .clone()
+            .ok_or_else(|| Error::Config("`bucket_name` required".to_string()))?;
+
         Ok(ReleaseList {
             end_point: self.end_point,
-            bucket_name: if let Some(ref name) = self.bucket_name {
-                name.to_owned()
-            } else {
-                bail!(Error::Config, "`bucket_name` required")
-            },
+            bucket_name,
             region: self.region.clone(),
             asset_prefix: self.asset_prefix.clone(),
             target: self.target.clone(),
@@ -143,14 +186,15 @@ impl ReleaseList {
             &self.asset_prefix,
             &self.auth_token,
         )?;
-        let releases = match self.target {
+
+        // Filter releases by target if specified
+        Ok(match &self.target {
             None => releases,
-            Some(ref target) => releases
+            Some(target) => releases
                 .into_iter()
                 .filter(|r| r.has_target_asset(target))
-                .collect::<Vec<_>>(),
-        };
-        Ok(releases)
+                .collect(),
+        })
     }
 }
 
@@ -265,7 +309,7 @@ impl UpdateBuilder {
     pub fn bin_name(&mut self, name: &str) -> &mut Self {
         let raw_bin_name = format!("{}{}", name.trim_end_matches(EXE_SUFFIX), EXE_SUFFIX);
         if self.bin_path_in_archive.is_none() {
-            self.bin_path_in_archive = Some(raw_bin_name.to_owned());
+            self.bin_path_in_archive = Some(raw_bin_name.clone());
         }
         self.bin_name = Some(raw_bin_name);
         self
@@ -378,43 +422,51 @@ impl UpdateBuilder {
     /// * Errors:
     ///     * Config - Invalid `Update` configuration
     pub fn build(&self) -> Result<Box<dyn ReleaseUpdate>> {
-        let bin_install_path = if let Some(v) = &self.bin_install_path {
-            v.clone()
-        } else {
-            env::current_exe()?
-        };
+        // Use functional combinators for optional values
+        let bin_install_path =
+            self.bin_install_path
+                .clone()
+                .unwrap_or_else(|| match env::current_exe() {
+                    Ok(path) => path,
+                    Err(e) => panic!("Failed to get current executable path: {}", e),
+                });
+
+        let bucket_name = self
+            .bucket_name
+            .clone()
+            .ok_or_else(|| Error::Config("`bucket_name` required".to_string()))?;
+
+        let target = self
+            .target
+            .clone()
+            .unwrap_or_else(|| get_target().to_owned());
+
+        let bin_name = self
+            .bin_name
+            .clone()
+            .ok_or_else(|| Error::Config("`bin_name` required".to_string()))?;
+
+        let bin_path_in_archive = self
+            .bin_path_in_archive
+            .clone()
+            .ok_or_else(|| Error::Config("`bin_path_in_archive` required".to_string()))?;
+
+        let current_version = self
+            .current_version
+            .clone()
+            .ok_or_else(|| Error::Config("`current_version` required".to_string()))?;
 
         Ok(Box::new(Update {
             end_point: self.end_point,
-            bucket_name: if let Some(ref name) = self.bucket_name {
-                name.to_owned()
-            } else {
-                bail!(Error::Config, "`bucket_name` required")
-            },
+            bucket_name,
             region: self.region.clone(),
             asset_prefix: self.asset_prefix.clone(),
-            target: self
-                .target
-                .as_ref()
-                .map(|t| t.to_owned())
-                .unwrap_or_else(|| get_target().to_owned()),
-            bin_name: if let Some(ref name) = self.bin_name {
-                name.to_owned()
-            } else {
-                bail!(Error::Config, "`bin_name` required")
-            },
+            target,
+            bin_name,
             bin_install_path,
-            bin_path_in_archive: if let Some(ref bin_path) = self.bin_path_in_archive {
-                bin_path.to_owned()
-            } else {
-                bail!(Error::Config, "`bin_path_in_archive` required")
-            },
-            current_version: if let Some(ref ver) = self.current_version {
-                ver.to_owned()
-            } else {
-                bail!(Error::Config, "`current_version` required")
-            },
-            target_version: self.target_version.as_ref().map(|v| v.to_owned()),
+            bin_path_in_archive,
+            current_version,
+            target_version: self.target_version.clone(),
             show_download_progress: self.show_download_progress,
             progress_template: self.progress_template.clone(),
             progress_chars: self.progress_chars.clone(),
@@ -459,33 +511,16 @@ impl Update {
 
 impl ReleaseUpdate for Update {
     fn get_latest_release(&self) -> Result<Release> {
-        let releases = fetch_releases_from_s3(
+        fetch_releases_from_s3(
             self.end_point,
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
             &self.auth_token,
-        )?;
-        let rel = releases
-            .iter()
-            .max_by(|x, y| match bump_is_greater(&y.version, &x.version) {
-                Ok(is_greater) => {
-                    if is_greater {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                Err(_) => {
-                    // Ignoring release due to an unexpected failure in parsing its version string
-                    Ordering::Less
-                }
-            });
-
-        match rel {
-            Some(r) => Ok(r.clone()),
-            None => bail!(Error::Release, "No release was found"),
-        }
+        )?
+        .into_iter()
+        .max_by(|x, y| compare_versions(&x.version, &y.version))
+        .ok_or_else(|| Error::Release("No release was found".to_string()))
     }
 
     fn get_latest_releases(&self, current_version: &str) -> Result<Vec<Release>> {
@@ -497,50 +532,33 @@ impl ReleaseUpdate for Update {
             &self.auth_token,
         )?;
 
+        // Filter releases newer than current version
         let mut releases = releases
-            .iter()
+            .into_iter()
             .filter(|r| bump_is_greater(current_version, &r.version).unwrap_or(false))
-            .cloned()
             .collect::<Vec<_>>();
 
-        releases.sort_by(|x, y| match bump_is_greater(&y.version, &x.version) {
-            Ok(is_greater) => {
-                if is_greater {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            Err(_) => {
-                // Ignoring release due to an unexpected failure in parsing its version string
-                Ordering::Less
-            }
-        });
+        // Sort by version (descending)
+        releases.sort_by(|x, y| compare_versions(&y.version, &x.version));
 
         Ok(releases)
     }
 
     fn get_release_version(&self, ver: &str) -> Result<Release> {
-        let releases = fetch_releases_from_s3(
+        fetch_releases_from_s3(
             self.end_point,
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
             &self.auth_token,
-        )?;
-        let rel = releases.iter().find(|x| x.version == ver);
-        match rel {
-            Some(r) => Ok(r.clone()),
-            None => bail!(
-                Error::Release,
-                "No release with version '{}' was found",
-                ver
-            ),
-        }
+        )?
+        .into_iter()
+        .find(|x| x.version == ver)
+        .ok_or_else(|| Error::Release(format!("No release with version '{}' was found", ver)))
     }
 
     fn current_version(&self) -> String {
-        self.current_version.to_owned()
+        self.current_version.clone()
     }
 
     fn target(&self) -> String {
@@ -576,11 +594,11 @@ impl ReleaseUpdate for Update {
     }
 
     fn progress_template(&self) -> String {
-        self.progress_template.to_owned()
+        self.progress_template.clone()
     }
 
     fn progress_chars(&self) -> String {
-        self.progress_chars.to_owned()
+        self.progress_chars.clone()
     }
 
     fn auth_token(&self) -> Option<String> {
@@ -590,6 +608,18 @@ impl ReleaseUpdate for Update {
     #[cfg(feature = "signatures")]
     fn verifying_keys(&self) -> &[[u8; zipsign_api::PUBLIC_KEY_LENGTH]] {
         &self.verifying_keys
+    }
+}
+
+/// Compare two version strings for ordering
+///
+/// Returns Ordering::Greater if v1 > v2, Ordering::Less if v1 < v2,
+/// and Ordering::Equal if they're equal or comparison fails
+fn compare_versions(v1: &str, v2: &str) -> Ordering {
+    match bump_is_greater(v2, v1) {
+        Ok(true) => Ordering::Greater,
+        Ok(false) => Ordering::Less,
+        Err(_) => Ordering::Less, // Error case - consider it less
     }
 }
 
@@ -604,19 +634,46 @@ fn fetch_releases_from_s3(
     asset_prefix: &Option<String>,
     auth_token: &Option<String>,
 ) -> Result<Vec<Release>> {
+    // Extract region or return error if not provided
     let region_str = region
         .as_ref()
         .ok_or_else(|| Error::Config("`region` required".to_string()))?;
 
-    fetch_releases_with_aws_sdk(
-        end_point,
-        bucket_name,
-        region_str,
-        asset_prefix,
-        auth_token,
-    )
+    fetch_releases_with_aws_sdk(end_point, bucket_name, region_str, asset_prefix, auth_token)
 }
 
+/// Create an AWS SDK config with the given credentials
+async fn create_aws_config(region: &str, auth_token: &Option<String>) -> SdkConfig {
+    // Start with default config that loads credentials from all standard locations
+    let mut config_builder =
+        aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region.to_string()));
+
+    // Apply explicit credentials if provided in auth_token (format: "ACCESS_KEY:SECRET_KEY")
+    if let Some(auth) = auth_token {
+        if let Some((access_key, secret_key)) = auth.split_once(':') {
+            debug!("Using provided AWS credentials");
+
+            // Import necessary types
+            use aws_sdk_s3::config::Credentials;
+
+            // Create credentials provider with the provided credentials
+            let credentials = Credentials::new(
+                access_key,
+                secret_key,
+                None, // session token
+                None, // expiry time
+                "self_update-provided",
+            );
+
+            config_builder = config_builder.credentials_provider(credentials);
+        }
+    }
+
+    debug!("Loading AWS configuration");
+    config_builder.load().await
+}
+
+/// Fetch releases from S3 using the AWS SDK
 fn fetch_releases_with_aws_sdk(
     end_point: EndPoint,
     bucket_name: &str,
@@ -628,54 +685,9 @@ fn fetch_releases_with_aws_sdk(
     let runtime = Runtime::new()
         .map_err(|e| Error::Network(format!("Failed to create async runtime: {}", e)))?;
 
-    let config = runtime.block_on(async {
-        // Build AWS SDK configuration with the following credential sources (in order):
-        // 1. Explicit credentials from auth_token if provided
-        // 2. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-        // 3. AWS credential files (~/.aws/credentials)
-        // 4. IAM roles for Amazon EC2 / container credentials
-        let region_provider = Region::new(region.to_string());
-
-        // Start with default config that loads credentials from all standard locations
-        let mut config_builder =
-            aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
-
-        // Apply explicit credentials if provided in auth_token (format: "ACCESS_KEY:SECRET_KEY")
-        if let Some(auth) = auth_token {
-            if auth.contains(':') {
-                let parts: Vec<&str> = auth.split(':').collect();
-                if parts.len() >= 2 {
-                    let access_key = parts[0];
-                    let secret_key = parts[1];
-
-                    debug!("Using provided AWS credentials");
-
-                    // Import necessary types
-                    use aws_sdk_s3::config::Credentials;
-
-                    // Create credentials provider with the provided credentials
-                    let credentials = Credentials::new(
-                        access_key,
-                        secret_key,
-                        None, // session token
-                        None, // expiry time
-                        "self_update-provided",
-                    );
-
-                    config_builder = config_builder.credentials_provider(credentials);
-                }
-            }
-        }
-
-        debug!("Loading AWS configuration");
-        config_builder.load().await
-    });
-
-    // Create S3 client
-    let s3_client = get_s3_client(end_point, &config, region)?;
-
-    // We'll directly use the list_objects_v2 method from the client below
-    // No need to create a builder separately
+    let config = runtime.block_on(create_aws_config(region, auth_token));
+    let s3_client = end_point.create_client(&config, region);
+    let download_base_url = end_point.download_base_url(bucket_name, region);
 
     // Build request parameters for debugging
     let prefix_str = asset_prefix.as_ref().map_or("None", |s| s.as_str());
@@ -684,19 +696,8 @@ fn fetch_releases_with_aws_sdk(
         bucket_name, region, prefix_str
     );
 
-    // Get the endpoint URL for constructing download URLs
-    let download_base_url = get_download_base_url(end_point, bucket_name, region)?;
     let mut releases = Vec::new();
     let mut continuation_token = None;
-
-    // Create regex for parsing filenames to extract version information
-    let regex = Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
-        .map_err(|err| {
-            Error::Release(format!(
-                "Failed constructing regex to parse S3 filenames: {}",
-                err
-            ))
-        })?;
 
     // Execute the request in the runtime with pagination support
     loop {
@@ -730,35 +731,25 @@ fn fetch_releases_with_aws_sdk(
         });
 
         // Handle potential error
-        let list_output = match list_result {
-            Ok(output) => output,
-            Err(err) => {
-                bail!(Error::Network, "Failed to list S3 objects: {}", err);
-            }
-        };
+        let list_output = list_result
+            .map_err(|err| Error::Network(format!("Failed to list S3 objects: {}", err)))?;
 
         // Process the current page of results
         let contents = list_output.contents();
 
-        // Process objects in this page
         for obj in contents {
-            let key = match obj.key() {
-                Some(k) => k,
-                None => continue, // Skip objects without keys
-            };
+            if let Some(key) = obj.key() {
+                let last_modified = obj
+                    .last_modified()
+                    .map(|dt| dt.to_string())
+                    .unwrap_or_default();
 
-            let last_modified = obj
-                .last_modified()
-                .map(|dt| dt.to_string())
-                .unwrap_or_default();
-
-            process_s3_object(
-                key,
-                &last_modified,
-                &download_base_url,
-                &regex,
-                &mut releases,
-            )?;
+                if let Err(e) =
+                    process_s3_object(key, &last_modified, &download_base_url, &mut releases)
+                {
+                    debug!("Error processing S3 object {}: {}", key, e);
+                }
+            }
         }
 
         // Check if there are more pages
@@ -775,92 +766,105 @@ fn fetch_releases_with_aws_sdk(
     Ok(releases)
 }
 
+/// Process an S3 object and add it to the releases list if it represents a valid release
 fn process_s3_object(
     key: &str,
     last_modified: &str,
     download_base_url: &str,
-    regex: &Regex,
     releases: &mut Vec<Release>,
 ) -> Result<()> {
     // Extract filename from key
     let p = PathBuf::from(key);
-    let exe_name = match p.file_name().map(|v| v.to_str()) {
-        Some(Some(v)) => v,
+    let exe_name = match p.file_name().and_then(|v| v.to_str()) {
+        Some(v) => v,
         _ => key,
     };
 
-    // Use regex to extract version information
-    if let Some(captures) = regex.captures(key) {
-        let mut release = Release::default();
-        release.name = captures["name"].to_string();
-        release.version = captures["version"].trim_start_matches('v').to_string();
-        release.date = last_modified.to_string();
-        release.assets = vec![ReleaseAsset {
-            name: exe_name.to_string(),
-            download_url: format!("s3://{}/{}", download_base_url.trim_end_matches('/'), key),
-        }];
+    // Extract version directly from path components
+    // Expected format: [directory/][semver/]<asset name>-<platform/target>.<extension>
+    let path_components: Vec<&str> = key.split('/').collect();
 
-        debug!("Matched release from key {}: {:?}", key, &release);
-        add_to_releases_list(releases, release);
-    } else {
-        debug!("Regex mismatch for key: {}", key);
+    debug!("Analyzing path components for key: {}", key);
+    if path_components.len() >= 2 {
+        // Check if second-to-last component looks like a semver
+        let potential_version = path_components[path_components.len() - 2];
+        debug!("Checking if '{}' is a version directory", potential_version);
+
+        // Simple semver check for x.y.z with optional pre-release and optional 'v' prefix
+        let semver_regex = Regex::new(r"^v?\d+\.\d+\.\d+(?:-[a-z0-9.]+)*$")
+            .map_err(|err| Error::Release(format!("Failed to create semver regex: {}", err)))?;
+
+        if semver_regex.is_match(potential_version) {
+            // We found a version directory containing assets
+            let asset_filename = path_components.last().unwrap();
+
+            // Extract base asset name from filename
+            let file_parts: Vec<&str> = asset_filename
+                .split('.')
+                .next()
+                .unwrap()
+                .split('-')
+                .collect();
+            let asset_name = extract_asset_name(&file_parts);
+
+            let release = Release {
+                name: asset_name,
+                version: potential_version.trim_start_matches('v').to_string(),
+                date: last_modified.to_string(),
+                assets: vec![ReleaseAsset {
+                    name: exe_name.to_string(),
+                    download_url: format!(
+                        "s3://{}/{}",
+                        download_base_url.trim_end_matches('/'),
+                        key
+                    ),
+                }],
+                body: None,
+            };
+
+            debug!(
+                "Matched release from directory structure {}: {:?}",
+                key, &release
+            );
+            add_to_releases_list(releases, release);
+            return Ok(());
+        }
     }
 
     Ok(())
 }
 
-fn get_download_base_url(end_point: EndPoint, bucket_name: &str, region: &str) -> Result<String> {
-    let base_url = match end_point {
-        EndPoint::S3 => format!("{}.s3.{}.amazonaws.com", bucket_name, region),
-        EndPoint::S3DualStack => format!("{}.s3.dualstack.{}.amazonaws.com", bucket_name, region),
-        EndPoint::GCS => format!("{}.storage.googleapis.com", bucket_name),
-        EndPoint::DigitalOceanSpaces => format!("{}.{}.digitaloceanspaces.com", bucket_name, region),
-    };
+/// Extract the asset name from file parts
+fn extract_asset_name(file_parts: &[&str]) -> String {
+    // Find where the target part starts by looking for architecture prefixes
+    let mut target_start_idx = 0;
+    for (idx, part) in file_parts.iter().enumerate() {
+        if ["x86_64", "aarch64", "i686", "armv7"].contains(part) {
+            target_start_idx = idx;
+            break;
+        }
+    }
 
-    Ok(base_url)
+    // If we found a target pattern, join all parts before it as the asset name
+    if target_start_idx > 0 {
+        file_parts[0..target_start_idx].join("-")
+    } else {
+        // Fallback to first part if we can't identify by architecture
+        file_parts[0].to_string()
+    }
 }
 
-fn get_s3_client(end_point: EndPoint, config: &SdkConfig, region: &str) -> Result<S3Client> {
-    Ok(match end_point {
-        EndPoint::S3 => S3Client::new(config),
-        EndPoint::S3DualStack => {
-            // Configure with dual-stack endpoint
-            let s3_config = aws_sdk_s3::config::Builder::from(config)
-                .use_dual_stack(true)
-                .build();
-            S3Client::from_conf(s3_config)
-        }
-        EndPoint::GCS => {
-            // For GCS, we use a custom endpoint
-            let s3_config = aws_sdk_s3::config::Builder::from(config)
-                .endpoint_url("https://storage.googleapis.com")
-                .build();
-            S3Client::from_conf(s3_config)
-        }
-        EndPoint::DigitalOceanSpaces => {
-            // For DigitalOcean Spaces, use their regional endpoint
-            let endpoint_url = format!("https://{}.digitaloceanspaces.com", region);
-            let s3_config = aws_sdk_s3::config::Builder::from(config)
-                .endpoint_url(endpoint_url)
-                .build();
-            S3Client::from_conf(s3_config)
-        }
-    })
-}
-
-
-// Add a release to the list if it's doesn't exist yet, or merge its asset/s
+// Add a release to the list if it doesn't exist yet, or merge its asset/s
 // details into the release item already existing in the list
 fn add_to_releases_list(releases: &mut Vec<Release>, mut rel: Release) {
     if !rel.version.is_empty() && !rel.name.is_empty() {
         match releases
-            .iter()
-            .position(|curr| curr.name == rel.name && curr.version == rel.version)
+            .iter_mut()
+            .find(|curr| curr.name == rel.name && curr.version == rel.version)
         {
-            Some(index) => {
-                rel.assets.append(&mut releases[index].assets);
-                releases.push(rel);
-                releases.swap_remove(index);
+            Some(existing) => {
+                // Merge assets into the existing release
+                existing.assets.append(&mut rel.assets);
             }
             None => releases.push(rel),
         }
