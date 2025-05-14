@@ -60,8 +60,37 @@ impl Release {
 
     /// Return the `ReleaseAsset` for the current release whose name
     /// contains the specified `target` and possibly `identifier`
-    /// When bin_name is specified, it's also used as a matching criterion
+    /// When bin_name is specified, it's prioritized as a matching criterion
     pub fn asset_for(&self, target: &str, identifier: Option<&str>, bin_name: Option<&str>) -> Option<ReleaseAsset> {
+        if let Some(name) = bin_name {
+            // First attempt: try to find an asset that matches ALL criteria including bin_name
+            let exact_match = self.assets
+                .iter()
+                .find(|asset| {
+                    // Check if asset contains target or OS/ARCH info
+                    let target_match = asset.name.contains(target) ||
+                                      (asset.name.contains(OS) && asset.name.contains(ARCH));
+
+                    // Check if asset contains identifier if specified
+                    let identifier_match = if let Some(i) = identifier {
+                        asset.name.contains(i)
+                    } else {
+                        true
+                    };
+
+                    // Check for bin_name match
+                    let bin_name_match = asset.name.contains(name);
+
+                    target_match && identifier_match && bin_name_match
+                });
+
+            // If we found an exact match, return it
+            if exact_match.is_some() {
+                return exact_match.cloned();
+            }
+        }
+
+        // Fallback to previous behavior if no bin_name was specified or no exact match was found
         self.assets
             .iter()
             .find(|asset| {
